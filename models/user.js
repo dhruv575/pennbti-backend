@@ -16,6 +16,10 @@ const userSchema = new mongoose.Schema({
   },
   mbti: String,
   gender: String,
+  scores: { 
+    type: [Number], 
+    default: [0, 0, 0, 0] 
+  },
   preference: [String],
   rooms: [{
     type: mongoose.Schema.Types.ObjectId,

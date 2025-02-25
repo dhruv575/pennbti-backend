@@ -98,35 +98,29 @@ const roomController = {
         return res.status(400).json({ message: 'Room is already inactive' });
       }
 
-      // Shuffle users array for random matching
-      const shuffledUsers = [...room.users].sort(() => Math.random() - 0.5);
+      // Fetch all users with their complete data
+      const users = await User.find({ _id: { $in: room.users } });
       
-      const matches = [];
+      // Calculate matches based on room type
+      let matches = [];
       
-      // Create pairs, handling odd number of users
-      for (let i = 0; i < shuffledUsers.length; i += 2) {
-        if (i + 1 >= shuffledUsers.length) {
-          // If this is the last person and no one is left to pair with
-          matches.push({
-            user1: shuffledUsers[i],
-            user2: shuffledUsers[i] // Match with self if odd number
-          });
-        } else {
-          matches.push({
-            user1: shuffledUsers[i],
-            user2: shuffledUsers[i + 1]
-          });
-        }
+      if (room.type === 'platonic') {
+        matches = createPlatonicMatches(users);
+      } else if (room.type === 'romantic') {
+        matches = createRomanticMatches(users);
+      } else {
+        return res.status(400).json({ message: 'Invalid room type' });
       }
 
+      // Save matches to room
       room.matches = matches;
       room.active = false;  // Deactivate room after matching
       await room.save();
 
       // Return populated matches data
       const populatedMatches = await Promise.all(matches.map(async match => {
-        const user1 = await User.findById(match.user1, 'name email mbti');
-        const user2 = await User.findById(match.user2, 'name email mbti');
+        const user1 = await User.findById(match.user1, 'name email mbti scores');
+        const user2 = await User.findById(match.user2, 'name email mbti scores');
         return { user1, user2 };
       }));
 
@@ -135,6 +129,7 @@ const roomController = {
         matches: populatedMatches
       });
     } catch (error) {
+      console.error('Error in createMatches:', error);
       res.status(400).json({ message: error.message });
     }
   },
@@ -282,6 +277,247 @@ const roomController = {
       });
       res.status(400).json({ message: error.message });
     }
+  },
+
+  // Calculate preference lists based on score similarity
+  calculatePreferenceLists: function calculatePreferenceLists(users) {
+    const preferenceLists = {};
+    
+    users.forEach(user => {
+      // Calculate distance to all other users
+      const distances = users
+        .filter(otherUser => otherUser._id.toString() !== user._id.toString())
+        .map(otherUser => {
+          // Calculate root squared distance between scores
+          const distance = Math.sqrt(
+            user.scores.reduce((sum, score, index) => {
+              const diff = score - otherUser.scores[index];
+              return sum + diff * diff;
+            }, 0)
+          );
+          
+          return {
+            userId: otherUser._id.toString(),
+            distance
+          };
+        });
+      
+      // Sort by distance (ascending)
+      distances.sort((a, b) => a.distance - b.distance);
+      
+      // Create preference list (just the user IDs in order)
+      preferenceLists[user._id.toString()] = distances.map(d => d.userId);
+    });
+    
+    return preferenceLists;
+  },
+
+  // Filter preference lists based on gender and preference
+  filterPreferencesByOrientation: function filterPreferencesByOrientation(users, preferenceLists) {
+    const filteredLists = {};
+    
+    users.forEach(user => {
+      const userId = user._id.toString();
+      const userPreference = user.preference || ['any'];
+      
+      // Filter the preference list to only include compatible users
+      filteredLists[userId] = preferenceLists[userId].filter(otherUserId => {
+        const otherUser = users.find(u => u._id.toString() === otherUserId);
+        
+        // If user prefers 'any', they're compatible with everyone
+        if (userPreference.includes('any')) {
+          return true;
+        }
+        
+        // Otherwise, check if the other user's gender matches this user's preference
+        return userPreference.includes(otherUser.gender);
+      });
+    });
+    
+    return filteredLists;
+  },
+
+  // Implement the "Everyone Proposes" Gale-Shapley algorithm
+  everyoneProposes: function everyoneProposes(users, preferenceLists) {
+    // Initialize all users as unmatched
+    const matches = {};
+    const unmatchedUsers = users.map(user => user._id.toString());
+    
+    // Create a copy of preference lists to modify during algorithm
+    const remainingPreferences = {};
+    users.forEach(user => {
+      remainingPreferences[user._id.toString()] = [...preferenceLists[user._id.toString()]];
+    });
+    
+    // Create a reverse lookup for preference rankings
+    const preferenceRanks = {};
+    users.forEach(user => {
+      const userId = user._id.toString();
+      preferenceRanks[userId] = {};
+      
+      preferenceLists[userId].forEach((prefId, index) => {
+        preferenceRanks[userId][prefId] = index;
+      });
+    });
+    
+    // Run the algorithm until no more proposals can be made
+    while (unmatchedUsers.length > 0) {
+      const currentUserId = unmatchedUsers[0];
+      
+      // If this user has no more preferences, remove from unmatched and continue
+      if (remainingPreferences[currentUserId].length === 0) {
+        unmatchedUsers.shift();
+        continue;
+      }
+      
+      // Get the highest-ranked remaining preference
+      const preferredUserId = remainingPreferences[currentUserId].shift();
+      
+      // If the preferred user is unmatched, create a match
+      if (!matches[preferredUserId]) {
+        matches[currentUserId] = preferredUserId;
+        matches[preferredUserId] = currentUserId;
+        unmatchedUsers.shift(); // Remove the proposer from unmatched
+      } 
+      // If the preferred user is already matched, they decide who they prefer
+      else {
+        const currentMatchId = matches[preferredUserId];
+        
+        // Check if they prefer the new proposer over their current match
+        if (preferenceRanks[preferredUserId][currentUserId] < 
+            preferenceRanks[preferredUserId][currentMatchId]) {
+          
+          // They prefer the new proposer, so update matches
+          delete matches[currentMatchId];
+          matches[currentUserId] = preferredUserId;
+          matches[preferredUserId] = currentUserId;
+          
+          // Add the previous match back to unmatched users
+          unmatchedUsers.shift(); // Remove current proposer
+          unmatchedUsers.push(currentMatchId); // Add previous match
+        }
+        // If they prefer their current match, the proposer stays unmatched
+        // and will try their next preference in the next iteration
+      }
+    }
+    
+    // Convert matches to the required format
+    const result = [];
+    const matchedUsers = new Set();
+    
+    for (const [user1Id, user2Id] of Object.entries(matches)) {
+      // Only add each pair once
+      if (!matchedUsers.has(user1Id) && !matchedUsers.has(user2Id)) {
+        result.push({
+          user1: user1Id,
+          user2: user2Id
+        });
+        
+        matchedUsers.add(user1Id);
+        matchedUsers.add(user2Id);
+      }
+    }
+    
+    return result;
+  },
+
+  // Create platonic matches
+  createPlatonicMatches: function createPlatonicMatches(users) {
+    // For platonic matching, everyone can match with everyone
+    const preferenceLists = calculatePreferenceLists(users);
+    
+    // Run the matching algorithm
+    let matches = everyoneProposes(users, preferenceLists);
+    
+    // Handle odd number of users - match the last person with themselves
+    if (users.length % 2 !== 0) {
+      // Find the unmatched user
+      const matchedUserIds = new Set();
+      matches.forEach(match => {
+        matchedUserIds.add(match.user1.toString());
+        matchedUserIds.add(match.user2.toString());
+      });
+      
+      const unmatchedUser = users.find(user => 
+        !matchedUserIds.has(user._id.toString())
+      );
+      
+      if (unmatchedUser) {
+        matches.push({
+          user1: unmatchedUser._id,
+          user2: unmatchedUser._id
+        });
+      }
+    }
+    
+    return matches;
+  },
+
+  // Create romantic matches
+  createRomanticMatches: function createRomanticMatches(users) {
+    // Calculate base preference lists
+    const basePreferenceLists = calculatePreferenceLists(users);
+    
+    // Filter by orientation for first round
+    const orientationFilteredLists = filterPreferencesByOrientation(users, basePreferenceLists);
+    
+    // First round of matching with orientation preferences
+    let matches = everyoneProposes(users, orientationFilteredLists);
+    
+    // Find unmatched users after first round
+    const matchedUserIds = new Set();
+    matches.forEach(match => {
+      matchedUserIds.add(match.user1.toString());
+      matchedUserIds.add(match.user2.toString());
+    });
+    
+    const unmatchedUsers = users.filter(user => 
+      !matchedUserIds.has(user._id.toString())
+    );
+    
+    // If there are unmatched users, do a second round with relaxed preferences
+    if (unmatchedUsers.length > 1) {
+      const unmatchedIds = unmatchedUsers.map(user => user._id.toString());
+      
+      // Create preference lists for unmatched users (only including other unmatched users)
+      const secondRoundLists = {};
+      unmatchedUsers.forEach(user => {
+        const userId = user._id.toString();
+        
+        // Filter to only include other unmatched users, sorted by score similarity
+        secondRoundLists[userId] = basePreferenceLists[userId]
+          .filter(prefId => unmatchedIds.includes(prefId));
+      });
+      
+      // Run second round of matching
+      const secondRoundMatches = everyoneProposes(unmatchedUsers, secondRoundLists);
+      
+      // Combine matches from both rounds
+      matches = [...matches, ...secondRoundMatches];
+    }
+    
+    // Handle odd number of users - match the last person with themselves
+    if (users.length % 2 !== 0) {
+      // Recalculate matched users after both rounds
+      const finalMatchedIds = new Set();
+      matches.forEach(match => {
+        finalMatchedIds.add(match.user1.toString());
+        finalMatchedIds.add(match.user2.toString());
+      });
+      
+      const finalUnmatched = users.find(user => 
+        !finalMatchedIds.has(user._id.toString())
+      );
+      
+      if (finalUnmatched) {
+        matches.push({
+          user1: finalUnmatched._id,
+          user2: finalUnmatched._id
+        });
+      }
+    }
+    
+    return matches;
   },
 };
 

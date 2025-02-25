@@ -62,10 +62,10 @@ const userController = {
     }
   },
 
-  // Update MBTI
+  // Update MBTI and scores
   updateMBTI: async (req, res) => {
     try {
-      const { mbti } = req.body;
+      const { mbti, scores } = req.body;
       const userId = req.user.userId;
 
       const user = await User.findById(userId);
@@ -74,10 +74,12 @@ const userController = {
       }
 
       user.mbti = mbti;
+      user.scores = scores;
       await user.save();
 
       res.status(200).json(user);
     } catch (error) {
+      console.error('Error in updateMBTI:', error);
       res.status(400).json({ message: error.message });
     }
   },
